@@ -11,10 +11,14 @@ pip install xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/
 pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
 pip install spconv-cu120
 
-git clone https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast
-pip install /tmp/nvdiffrast && rm -rf /tmp/nvdiffrast
+python -c "import nvdiffrast" 2>/dev/null || {
+    git clone https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast
+    pip install /tmp/nvdiffrast && rm -rf /tmp/nvdiffrast
+}
 
-git clone --recursive https://github.com/autonomousvision/mip-splatting.git /tmp/mip
-pip install --no-build-isolation /tmp/mip/submodules/diff-gaussian-rasterization && rm -rf /tmp/mip
+python -c "import diff_gaussian_rasterization" 2>/dev/null || {
+    git clone --recursive https://github.com/autonomousvision/mip-splatting.git /tmp/mip
+    pip install --no-build-isolation /tmp/mip/submodules/diff-gaussian-rasterization && rm -rf /tmp/mip
+}
 
 pip install fastapi uvicorn pydantic
