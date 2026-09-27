@@ -5,7 +5,7 @@ FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libgomp1 \
+    && apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libegl1 libgles2 libglvnd0 libopengl0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned TRELLIS checkout (MIT licensed, (c) Microsoft).

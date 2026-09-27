@@ -6,7 +6,7 @@ set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libgomp1
+apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libegl1 libgles2 libglvnd0 libopengl0 libgomp1
 rm -rf /var/lib/apt/lists/*
 
 TRELLIS_SHA=442aa1e1afb9014e80681d3bf604e8d728a86ee7
