@@ -11,7 +11,8 @@ RUN apt-get update \
 # Pinned TRELLIS checkout (MIT licensed, (c) Microsoft).
 ARG TRELLIS_SHA=442aa1e1afb9014e80681d3bf604e8d728a86ee7
 RUN git clone https://github.com/microsoft/TRELLIS.git /app/TRELLIS \
-    && git -C /app/TRELLIS checkout ${TRELLIS_SHA}
+    && git -C /app/TRELLIS checkout ${TRELLIS_SHA} \
+    && git -C /app/TRELLIS submodule update --init --recursive
 
 # diff-gaussian-rasterization is compiled ahead-of-time without a GPU: cover A100 / A5000-A40 /
 # 4090-L40S (+PTX for anything newer). nvdiffrast JIT-compiles on the pod at first use.
@@ -21,6 +22,7 @@ RUN bash /app/install_deps.sh
 
 COPY server.py /app/server.py
 ENV PYTHONPATH=/app/TRELLIS \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
     ATTN_BACKEND=xformers \
     SPCONV_ALGO=native \
     HF_HOME=/workspace/hf \

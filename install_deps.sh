@@ -13,7 +13,7 @@ pip install spconv-cu120
 
 python -c "import nvdiffrast" 2>/dev/null || {
     git clone https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast
-    pip install /tmp/nvdiffrast && rm -rf /tmp/nvdiffrast
+    pip install --no-build-isolation /tmp/nvdiffrast && rm -rf /tmp/nvdiffrast
 }
 
 python -c "import diff_gaussian_rasterization" 2>/dev/null || {

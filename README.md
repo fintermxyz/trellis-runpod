@@ -11,11 +11,15 @@ Image: `ghcr.io/fintermxyz/trellis-runpod:latest` (built by the GitHub Action in
 | Route | Auth | What |
 |---|---|---|
 | `GET /health` | – | `{ok, gpu, model_loaded}` |
-| `POST /generate` | `X-Token` | `{name, prompt, seed, simplify, texture_size}` → renders `<name>.glb` + 4-view `<name>.png` |
+| `POST /generate` | `X-Token` | `{name, mode: "text"\|"image", prompt?, image?, seed, simplify, texture_size, ss_steps?, ss_cfg?, slat_steps?, slat_cfg?}` → renders `<name>.glb` + 4-view `<name>.png` |
 | `GET /asset/<name>.glb\|.png` | `X-Token` | download a result |
 
-Set `GEN_TOKEN` in the pod env. First `/generate` loads `microsoft/TRELLIS-text-xlarge`
-(~10 min incl. download); after that each asset takes ~1–3 min on an RTX 4090.
+Set `GEN_TOKEN` in the pod env. `mode:"image"` (single object photo as data URL /
+base64; rembg strips the background) runs `TRELLIS-image-large` — markedly higher
+fidelity than text mode (`TRELLIS-text-xlarge`), and the Tripo-style path: make an
+image first, then lift it to 3D. The two pipelines don't share a 24 GB card, so
+switching modes reloads (~1 min from a warm HF cache, ~10 min first ever). Warm
+generations take ~1–3 min on an RTX 4090.
 
 ## RunPod
 

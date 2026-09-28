@@ -19,12 +19,17 @@ if [ ! -d /app/TRELLIS ]; then
     git clone https://github.com/microsoft/TRELLIS.git /app/TRELLIS
     git -C /app/TRELLIS checkout "$TRELLIS_SHA"
 fi
+# flexicubes (the mesh decoder) is a git submodule; without it the server
+# dies at import time with ModuleNotFoundError trellis...flexicubes.flexicubes
+git -C /app/TRELLIS submodule update --init --recursive
 
 bash /app/repo/install_deps.sh
 cp /app/repo/server.py /app/server.py
 
 export PYTHONPATH=/app/TRELLIS
 export ATTN_BACKEND=xformers SPCONV_ALGO=native
+# conda's bundled libstdc++ predates GLIBCXX_3.4.30, which pip's open3d needs
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 export HF_HOME="${HF_HOME:-/workspace/hf}"
 cd /app
 exec python -m uvicorn server:app --host 0.0.0.0 --port 8000
