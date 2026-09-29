@@ -21,4 +21,5 @@ python -c "import diff_gaussian_rasterization" 2>/dev/null || {
     pip install --no-build-isolation /tmp/mip/submodules/diff-gaussian-rasterization && rm -rf /tmp/mip
 }
 
+pip install "diffusers>=0.31" accelerate
 pip install fastapi uvicorn pydantic

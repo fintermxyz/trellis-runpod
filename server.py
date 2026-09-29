@@ -48,6 +48,11 @@ MODELS = {
     "text": os.environ.get("TEXT_MODEL", "microsoft/TRELLIS-text-xlarge"),
     "image": os.environ.get("IMAGE_MODEL", "microsoft/TRELLIS-image-large"),
 }
+# Text requests go text -> SDXL concept image -> image-to-3D by default (the
+# Tripo architecture; markedly better than direct text-to-3D). Set
+# TEXT_VIA_IMAGE=0 to fall back to TRELLIS-text-xlarge directly.
+TEXT_VIA_IMAGE = os.environ.get("TEXT_VIA_IMAGE", "1") != "0"
+SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 
 
 def _check(x_token: str) -> None:
@@ -80,6 +85,43 @@ def _get_pipe(mode: str):
     return _pipes[mode]
 
 
+def _concept_image(prompt: str, seed: int):
+    """SDXL concept render of the prompt: one centered object, plain backdrop.
+    The 3D stage's own preprocessing (rembg) strips the background after."""
+    import gc
+
+    import torch
+
+    # A 24 GB card can't hold SDXL and a TRELLIS pipeline together.
+    _pipes.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    from diffusers import DiffusionPipeline
+
+    sdxl = DiffusionPipeline.from_pretrained(
+        SDXL_MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
+    ).to("cuda")
+    sdxl.set_progress_bar_config(disable=True)
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        img = sdxl(
+            prompt=f"{prompt}, single object, centered, full object in frame, "
+            "3D render style, plain light gray studio background, soft even lighting, highly detailed",
+            negative_prompt="cropped, cut off, multiple objects, collage, text, watermark, "
+            "busy background, scenery, frame, border, humans hands",
+            num_inference_steps=30,
+            guidance_scale=7.0,
+            width=1024,
+            height=1024,
+            generator=gen,
+        ).images[0]
+    finally:
+        del sdxl
+        gc.collect()
+        torch.cuda.empty_cache()
+    return img
+
+
 def _decode_image(data: str):
     from PIL import Image
 
@@ -97,6 +139,7 @@ def health():
         "ok": True,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded": sorted(_pipes.keys()),
+        "text_via_image": TEXT_VIA_IMAGE,
         "model_loaded": bool(_pipes),  # back-compat
         # Seconds since the last /generate (or boot). An external janitor can
         # stop the pod when this grows large — the pod is the one place that
@@ -136,7 +179,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
     _last_used = time.time()
     try:
         t0 = time.time()
-        pipe = _get_pipe(req.mode)
+        pipe = None if (req.mode == "text" and TEXT_VIA_IMAGE) else _get_pipe(req.mode)
 
         # Sampler overrides: only what the caller sets; pipeline defaults otherwise.
         sampler = {}
@@ -155,7 +198,16 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         if slat:
             sampler["slat_sampler_params"] = slat
 
-        subject = _decode_image(req.image) if req.mode == "image" else req.prompt
+        if req.mode == "image":
+            subject = _decode_image(req.image)
+        elif TEXT_VIA_IMAGE:
+            # Tripo-style: render a concept image first, then lift it to 3D.
+            concept = _concept_image(req.prompt, req.seed)
+            concept.save(str(OUT / f"{req.name}_src.png"))
+            subject = concept.convert("RGBA")
+            pipe = _get_pipe("image")
+        else:
+            subject = req.prompt
         out = pipe.run(subject, seed=req.seed, formats=["gaussian", "mesh"], **sampler)
         gaussian, mesh = out["gaussian"][0], out["mesh"][0]
 
@@ -193,7 +245,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
 @app.get("/asset/{fname}")
 def asset(fname: str, x_token: str = Header(default="")):
     _check(x_token)
-    if not re.fullmatch(r"[a-z0-9_]{1,40}\.(glb|png)", fname):
+    if not re.fullmatch(r"[a-z0-9_]{1,44}\.(glb|png)", fname):
         raise HTTPException(400, "bad file")
     p = OUT / fname
     if not p.exists():
