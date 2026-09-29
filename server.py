@@ -42,6 +42,7 @@ TOKEN = os.environ.get("GEN_TOKEN", "")
 app = FastAPI()
 _lock = threading.Lock()
 _pipes = {}
+_last_used = time.time()  # boot counts as activity: gives a fresh pod a grace period
 
 MODELS = {
     "text": os.environ.get("TEXT_MODEL", "microsoft/TRELLIS-text-xlarge"),
@@ -97,6 +98,10 @@ def health():
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded": sorted(_pipes.keys()),
         "model_loaded": bool(_pipes),  # back-compat
+        # Seconds since the last /generate (or boot). An external janitor can
+        # stop the pod when this grows large — the pod is the one place that
+        # sees traffic from every client, so idle is judged here.
+        "idle_s": int(time.time() - _last_used),
     }
 
 
@@ -127,6 +132,8 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         raise HTTPException(400, "prompt required for mode='text'")
     if not _lock.acquire(timeout=2):
         raise HTTPException(409, "busy")
+    global _last_used
+    _last_used = time.time()
     try:
         t0 = time.time()
         pipe = _get_pipe(req.mode)
@@ -179,6 +186,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         traceback.print_exc()
         raise HTTPException(500, f"{type(e).__name__}: {e}")
     finally:
+        _last_used = time.time()
         _lock.release()
 
 
