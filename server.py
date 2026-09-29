@@ -43,6 +43,30 @@ app = FastAPI()
 _lock = threading.Lock()
 _pipes = {}
 _last_used = time.time()  # boot counts as activity: gives a fresh pod a grace period
+# Per-job stage progress, polled by clients via GET /progress/<name>.
+# Stages run in order; pct is overall 0-100.
+_progress: dict = {}
+STAGES = {
+    "loading": (0, 5, "Loading models"),
+    "concept": (5, 20, "Drawing the concept image"),
+    "shape": (20, 55, "Building the 3D shape"),
+    "cleanup": (55, 62, "Cleaning up the mesh"),
+    "texture": (62, 94, "Painting textures"),
+    "export": (94, 100, "Exporting GLB"),
+    "done": (100, 100, "Done"),
+}
+
+
+def _stage(name: str, stage: str, frac: float = 0.0) -> None:
+    """Record that job `name` is in `stage`, `frac` of the way through it."""
+    lo, hi, label = STAGES[stage]
+    _progress[name] = {
+        "stage": stage,
+        "label": label,
+        "pct": int(lo + (hi - lo) * max(0.0, min(1.0, frac))),
+        "stage_end": hi,
+        "updated": time.time(),
+    }
 
 MODELS = {
     "text": os.environ.get("TEXT_MODEL", "microsoft/TRELLIS-text-xlarge"),
@@ -114,7 +138,7 @@ CONCEPT_NEGATIVE = (
 )
 
 
-def _concept_image(prompt: str, seed: int):
+def _concept_image(prompt: str, seed: int, name: str = ""):
     """Concept render of the prompt: one centered, front-facing, symmetric
     object on a plain backdrop. Symmetry constraints matter: the 3D stage sees
     ONE view and hallucinates the back, so an ambiguous pose becomes mirrored
@@ -152,6 +176,15 @@ def _concept_image(prompt: str, seed: int):
         pipe.set_progress_bar_config(disable=True)
         if not small_card:
             _pipes[key] = pipe
+    total_steps = 4 if CONCEPT_MODEL == "flux" else 30
+
+    def on_step(_pipe, step, _t, kwargs):
+        if name:
+            _stage(name, "concept", (step + 1) / total_steps)
+        return kwargs
+
+    if name:
+        _stage(name, "concept", 0.0)
     try:
         gen = torch.Generator(device="cuda").manual_seed(seed)
         if CONCEPT_MODEL == "flux":
@@ -163,6 +196,7 @@ def _concept_image(prompt: str, seed: int):
                 width=1024,
                 height=1024,
                 generator=gen,
+                callback_on_step_end=on_step,
             ).images[0]
         else:
             img = pipe(
@@ -173,6 +207,7 @@ def _concept_image(prompt: str, seed: int):
                 width=1024,
                 height=1024,
                 generator=gen,
+                callback_on_step_end=on_step,
             ).images[0]
     finally:
         if small_card:
@@ -204,9 +239,11 @@ def _hunyuan_generate(img, req) -> int:
         img = BackgroundRemover()(img.convert("RGB"))
 
     if "hy_shape" not in _pipes:
+        _stage(req.name, "loading", 0.5)
         from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
         _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+    _stage(req.name, "shape", 0.0)
     mesh = _pipes["hy_shape"](
         image=img,
         num_inference_steps=int(req.ss_steps or 30),
@@ -217,6 +254,7 @@ def _hunyuan_generate(img, req) -> int:
 
     from hy3dgen.shapegen import DegenerateFaceRemover, FaceReducer, FloaterRemover
 
+    _stage(req.name, "cleanup", 0.0)
     mesh = FloaterRemover()(mesh)
     mesh = DegenerateFaceRemover()(mesh)
     # simplify 0.9 -> 40k faces (the repo's own texturing budget), 0.85 -> 60k.
@@ -225,11 +263,14 @@ def _hunyuan_generate(img, req) -> int:
 
     if HUNYUAN_PAINT and req.paint:
         if "hy_paint" not in _pipes:
+            _stage(req.name, "texture", 0.05)
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
             _pipes["hy_paint"] = Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+        _stage(req.name, "texture", 0.1)
         mesh = _pipes["hy_paint"](mesh, image=img)
 
+    _stage(req.name, "export", 0.0)
     mesh.export(str(OUT / f"{req.name}.glb"))
     grid = _preview_grid(mesh)
     import imageio
@@ -359,7 +400,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
             subject = _decode_image(req.image)
         elif TEXT_VIA_IMAGE:
             # Tripo-style: render a concept image first, then lift it to 3D.
-            concept = _concept_image(req.prompt, req.seed)
+            concept = _concept_image(req.prompt, req.seed, req.name)
             concept.save(str(OUT / f"{req.name}_src.png"))
             subject = concept.convert("RGBA")
         else:
@@ -369,6 +410,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
 
         if BACKEND == "hunyuan":
             verts = _hunyuan_generate(subject, req)
+            _stage(req.name, "done", 1.0)
             return {
                 "ok": True,
                 "mode": req.mode,
@@ -411,6 +453,16 @@ def generate(req: GenReq, x_token: str = Header(default="")):
     finally:
         _last_used = time.time()
         _lock.release()
+
+
+@app.get("/progress/{name}")
+def progress(name: str, x_token: str = Header(default="")):
+    _check(x_token)
+    p = _progress.get(name)
+    if p is None:
+        # Not started here: either waiting behind another job or unknown.
+        return {"stage": "waiting" if _lock.locked() else "unknown", "pct": 0, "busy": _lock.locked()}
+    return {**p, "busy": _lock.locked(), "age_s": int(time.time() - p["updated"])}
 
 
 @app.get("/asset/{fname}")
