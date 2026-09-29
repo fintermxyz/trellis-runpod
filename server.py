@@ -167,7 +167,7 @@ def _hunyuan_generate(img, req) -> int:
     facenum = max(20000, min(120000, int(400000 * (1.0 - req.simplify))))
     mesh = FaceReducer()(mesh, max_facenum=facenum)
 
-    if HUNYUAN_PAINT:
+    if HUNYUAN_PAINT and req.paint:
         if "hy_paint" not in _pipes:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
@@ -253,6 +253,8 @@ class GenReq(BaseModel):
     seed: int = 0
     simplify: float = 0.9
     texture_size: int = 1024
+    # Draft tier: skip the texture-paint pass (fast, untextured preview).
+    paint: bool = True
     ss_steps: int | None = None
     ss_cfg: float | None = None
     slat_steps: int | None = None
