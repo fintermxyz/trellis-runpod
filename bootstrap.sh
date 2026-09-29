@@ -24,10 +24,15 @@ fi
 git -C /app/TRELLIS submodule update --init --recursive
 
 bash /app/repo/install_deps.sh
+# Optional higher-fidelity image-to-3D backend (BACKEND=hunyuan in the pod env)
+if [ "${BACKEND:-trellis}" = "hunyuan" ]; then
+    bash /app/repo/install_deps_hunyuan.sh
+fi
 cp /app/repo/server.py /app/server.py
 
 export PYTHONPATH=/app/TRELLIS
 export ATTN_BACKEND=xformers SPCONV_ALGO=native
+export PYOPENGL_PLATFORM=egl
 # conda's bundled libstdc++ predates GLIBCXX_3.4.30, which pip's open3d needs
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 export HF_HOME="${HF_HOME:-/workspace/hf}"

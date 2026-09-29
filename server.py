@@ -53,6 +53,12 @@ MODELS = {
 # TEXT_VIA_IMAGE=0 to fall back to TRELLIS-text-xlarge directly.
 TEXT_VIA_IMAGE = os.environ.get("TEXT_VIA_IMAGE", "1") != "0"
 SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+# 3D backend: "trellis" (default) or "hunyuan" (Hunyuan3D-2.0, image-conditioned
+# only — text prompts go through the SDXL concept stage first). Hunyuan needs
+# BACKEND=hunyuan in the pod env so bootstrap installs hy3dgen.
+BACKEND = os.environ.get("BACKEND", "trellis")
+HUNYUAN_MODEL = os.environ.get("HUNYUAN_MODEL", "tencent/Hunyuan3D-2")
+HUNYUAN_PAINT = os.environ.get("HUNYUAN_PAINT", "1") != "0"
 
 
 def _check(x_token: str) -> None:
@@ -122,6 +128,96 @@ def _concept_image(prompt: str, seed: int):
     return img
 
 
+def _hunyuan_generate(img, req) -> int:
+    """Hunyuan3D-2.0: image -> shape DiT -> cleanup -> optional texture paint.
+    Writes <name>.glb then <name>.png (keep that order). Returns vertex count."""
+    import gc
+
+    import torch
+
+    # Evict TRELLIS/SDXL pipelines; shape+paint together fit 24 GB (16 GB doc'd).
+    for k in [k for k in list(_pipes) if not k.startswith("hy_")]:
+        del _pipes[k]
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from hy3dgen.rembg import BackgroundRemover
+
+    alpha = img.getextrema()[3] if img.mode == "RGBA" else (255, 255)
+    if alpha[0] == 255:  # no real transparency: strip the background
+        img = BackgroundRemover()(img.convert("RGB"))
+
+    if "hy_shape" not in _pipes:
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+        _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+    mesh = _pipes["hy_shape"](
+        image=img,
+        num_inference_steps=int(req.ss_steps or 30),
+        guidance_scale=float(req.ss_cfg or 5.0),
+        octree_resolution=380,
+        generator=torch.manual_seed(req.seed),
+    )[0]
+
+    from hy3dgen.shapegen import DegenerateFaceRemover, FaceReducer, FloaterRemover
+
+    mesh = FloaterRemover()(mesh)
+    mesh = DegenerateFaceRemover()(mesh)
+    # simplify 0.9 -> 40k faces (the repo's own texturing budget), 0.85 -> 60k.
+    facenum = max(20000, min(120000, int(400000 * (1.0 - req.simplify))))
+    mesh = FaceReducer()(mesh, max_facenum=facenum)
+
+    if HUNYUAN_PAINT:
+        if "hy_paint" not in _pipes:
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+            _pipes["hy_paint"] = Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+        mesh = _pipes["hy_paint"](mesh, image=img)
+
+    mesh.export(str(OUT / f"{req.name}.glb"))
+    grid = _preview_grid(mesh)
+    import imageio
+
+    imageio.imwrite(str(OUT / f"{req.name}.png"), grid)
+    return int(mesh.vertices.shape[0])
+
+
+def _preview_grid(mesh):
+    """2x2 turntable of a trimesh via pyrender EGL (the repo ships no renderer)."""
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    import numpy as np
+
+    if not hasattr(np, "infty"):
+        np.infty = np.inf  # pyrender 0.1.45 predates numpy 2
+    import pyrender
+
+    m = mesh.copy()
+    m.apply_translation(-m.bounding_box.centroid)
+    m.apply_scale(1.0 / max(float(max(m.extents)), 1e-6))
+
+    frames = []
+    for yaw in (0, 90, 180, 270):
+        scene = pyrender.Scene(bg_color=[0, 0, 0, 255], ambient_light=[0.35, 0.35, 0.35])
+        scene.add(pyrender.Mesh.from_trimesh(m, smooth=False))
+        theta, elev, r = np.deg2rad(yaw), np.deg2rad(20), 1.9
+        eye = np.array([r * np.cos(elev) * np.sin(theta), r * np.sin(elev), r * np.cos(elev) * np.cos(theta)])
+        z = eye / np.linalg.norm(eye)
+        x = np.cross(np.array([0.0, 1.0, 0.0]), z)
+        x /= np.linalg.norm(x)
+        y = np.cross(z, x)
+        pose = np.eye(4)
+        pose[:3, 0], pose[:3, 1], pose[:3, 2], pose[:3, 3] = x, y, z, eye
+        scene.add(pyrender.PerspectiveCamera(yfov=float(np.deg2rad(40))), pose=pose)
+        scene.add(pyrender.DirectionalLight(intensity=3.0), pose=pose)
+        renderer = pyrender.OffscreenRenderer(512, 512)
+        color, _ = renderer.render(scene)
+        renderer.delete()
+        frames.append(color)
+    return np.concatenate(
+        [np.concatenate(frames[0:2], axis=1), np.concatenate(frames[2:4], axis=1)], axis=0
+    )
+
+
 def _decode_image(data: str):
     from PIL import Image
 
@@ -139,6 +235,7 @@ def health():
         "ok": True,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded": sorted(_pipes.keys()),
+        "backend": BACKEND,
         "text_via_image": TEXT_VIA_IMAGE,
         "model_loaded": bool(_pipes),  # back-compat
         # Seconds since the last /generate (or boot). An external janitor can
@@ -179,7 +276,8 @@ def generate(req: GenReq, x_token: str = Header(default="")):
     _last_used = time.time()
     try:
         t0 = time.time()
-        pipe = None if (req.mode == "text" and TEXT_VIA_IMAGE) else _get_pipe(req.mode)
+        skip_early_load = BACKEND == "hunyuan" or (req.mode == "text" and TEXT_VIA_IMAGE)
+        pipe = None if skip_early_load else _get_pipe(req.mode)
 
         # Sampler overrides: only what the caller sets; pipeline defaults otherwise.
         sampler = {}
@@ -205,9 +303,23 @@ def generate(req: GenReq, x_token: str = Header(default="")):
             concept = _concept_image(req.prompt, req.seed)
             concept.save(str(OUT / f"{req.name}_src.png"))
             subject = concept.convert("RGBA")
-            pipe = _get_pipe("image")
         else:
+            if BACKEND == "hunyuan":
+                raise HTTPException(400, "hunyuan backend is image-conditioned; enable TEXT_VIA_IMAGE")
             subject = req.prompt
+
+        if BACKEND == "hunyuan":
+            verts = _hunyuan_generate(subject, req)
+            return {
+                "ok": True,
+                "mode": req.mode,
+                "backend": "hunyuan",
+                "ms": int((time.time() - t0) * 1000),
+                "verts": verts,
+            }
+
+        if pipe is None:
+            pipe = _get_pipe("image")
         out = pipe.run(subject, seed=req.seed, formats=["gaussian", "mesh"], **sampler)
         gaussian, mesh = out["gaussian"][0], out["mesh"][0]
 
