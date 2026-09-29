@@ -53,6 +53,9 @@ MODELS = {
 # TEXT_VIA_IMAGE=0 to fall back to TRELLIS-text-xlarge directly.
 TEXT_VIA_IMAGE = os.environ.get("TEXT_VIA_IMAGE", "1") != "0"
 SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+# Concept-image model: "flux" (FLUX.1-schnell, Apache, much better anatomy) or "sdxl".
+CONCEPT_MODEL = os.environ.get("CONCEPT_MODEL", "flux")
+FLUX_MODEL = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.1-schnell")
 # 3D backend: "trellis" (default) or "hunyuan" (Hunyuan3D-2.0, image-conditioned
 # only — text prompts go through the SDXL concept stage first). Hunyuan needs
 # BACKEND=hunyuan in the pod env so bootstrap installs hy3dgen.
@@ -91,40 +94,82 @@ def _get_pipe(mode: str):
     return _pipes[mode]
 
 
+def _gpu_total_gb() -> float:
+    import torch
+
+    return torch.cuda.get_device_properties(0).total_memory / 1e9
+
+
+CONCEPT_SUFFIX = (
+    ", single object, perfectly centered, symmetrical front view, neutral standing pose, "
+    "full object in frame, limbs and tail clearly separated and visible, 3D render style, "
+    "plain light gray studio background, soft even lighting, highly detailed"
+)
+CONCEPT_NEGATIVE = (
+    "cropped, cut off, multiple objects, duplicated limbs, extra tail, collage, side view, "
+    "rear view, dynamic pose, motion blur, text, watermark, busy background, scenery, frame, border, human hands"
+)
+
+
 def _concept_image(prompt: str, seed: int):
-    """SDXL concept render of the prompt: one centered object, plain backdrop.
-    The 3D stage's own preprocessing (rembg) strips the background after."""
+    """Concept render of the prompt: one centered, front-facing, symmetric
+    object on a plain backdrop. Symmetry constraints matter: the 3D stage sees
+    ONE view and hallucinates the back, so an ambiguous pose becomes mirrored
+    limbs and doubled tails. FLUX.1-schnell by default (far better anatomy
+    than SDXL base); the 3D stage's rembg strips the background after."""
     import gc
 
     import torch
 
-    # A 24 GB card can't hold SDXL and a TRELLIS pipeline together.
-    _pipes.clear()
-    gc.collect()
-    torch.cuda.empty_cache()
-    from diffusers import DiffusionPipeline
-
-    sdxl = DiffusionPipeline.from_pretrained(
-        SDXL_MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
-    ).to("cuda")
-    sdxl.set_progress_bar_config(disable=True)
-    try:
-        gen = torch.Generator(device="cuda").manual_seed(seed)
-        img = sdxl(
-            prompt=f"{prompt}, single object, centered, full object in frame, "
-            "3D render style, plain light gray studio background, soft even lighting, highly detailed",
-            negative_prompt="cropped, cut off, multiple objects, collage, text, watermark, "
-            "busy background, scenery, frame, border, humans hands",
-            num_inference_steps=30,
-            guidance_scale=7.0,
-            width=1024,
-            height=1024,
-            generator=gen,
-        ).images[0]
-    finally:
-        del sdxl
+    # Small (24 GB) cards can't hold the concept model next to a 3D pipeline;
+    # big cards keep everything resident and skip the reload tax.
+    small_card = _gpu_total_gb() < 30
+    if small_card:
+        _pipes.clear()
         gc.collect()
         torch.cuda.empty_cache()
+
+    key = f"concept_{CONCEPT_MODEL}"
+    pipe = _pipes.get(key)
+    if pipe is None:
+        from diffusers import DiffusionPipeline
+
+        if CONCEPT_MODEL == "flux":
+            pipe = DiffusionPipeline.from_pretrained(FLUX_MODEL, torch_dtype=torch.bfloat16).to("cuda")
+        else:
+            pipe = DiffusionPipeline.from_pretrained(
+                SDXL_MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
+            ).to("cuda")
+        pipe.set_progress_bar_config(disable=True)
+        if not small_card:
+            _pipes[key] = pipe
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        if CONCEPT_MODEL == "flux":
+            # schnell is distilled: 4 steps, guidance 0, no negative prompt.
+            img = pipe(
+                prompt=f"{prompt}{CONCEPT_SUFFIX}",
+                num_inference_steps=4,
+                guidance_scale=0.0,
+                width=1024,
+                height=1024,
+                generator=gen,
+            ).images[0]
+        else:
+            img = pipe(
+                prompt=f"{prompt}{CONCEPT_SUFFIX}",
+                negative_prompt=CONCEPT_NEGATIVE,
+                num_inference_steps=30,
+                guidance_scale=7.0,
+                width=1024,
+                height=1024,
+                generator=gen,
+            ).images[0]
+    finally:
+        if small_card:
+            del pipe
+            gc.collect()
+            torch.cuda.empty_cache()
     return img
 
 
@@ -135,11 +180,13 @@ def _hunyuan_generate(img, req) -> int:
 
     import torch
 
-    # Evict TRELLIS/SDXL pipelines; shape+paint together fit 24 GB (16 GB doc'd).
-    for k in [k for k in list(_pipes) if not k.startswith("hy_")]:
-        del _pipes[k]
-    gc.collect()
-    torch.cuda.empty_cache()
+    # Small cards: evict non-Hunyuan pipelines (shape+paint alone need ~16 GB).
+    # Big cards keep the concept model resident too.
+    if _gpu_total_gb() < 30:
+        for k in [k for k in list(_pipes) if not k.startswith("hy_")]:
+            del _pipes[k]
+        gc.collect()
+        torch.cuda.empty_cache()
 
     from hy3dgen.rembg import BackgroundRemover
 
