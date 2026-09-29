@@ -52,9 +52,12 @@ MODELS = {
 # Tripo architecture; markedly better than direct text-to-3D). Set
 # TEXT_VIA_IMAGE=0 to fall back to TRELLIS-text-xlarge directly.
 TEXT_VIA_IMAGE = os.environ.get("TEXT_VIA_IMAGE", "1") != "0"
-SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
-# Concept-image model: "flux" (FLUX.1-schnell, Apache, much better anatomy) or "sdxl".
-CONCEPT_MODEL = os.environ.get("CONCEPT_MODEL", "flux")
+# RealVisXL: ungated SDXL finetune with far better anatomy than base SDXL.
+SDXL_MODEL = os.environ.get("SDXL_MODEL", "SG161222/RealVisXL_V5.0")
+# Concept-image model. FLUX.1-schnell is the best option but its HF repo is
+# gated: it only works when the pod env carries an HF_TOKEN that has accepted
+# the FLUX terms (huggingface_hub picks the token up automatically).
+CONCEPT_MODEL = os.environ.get("CONCEPT_MODEL", "flux" if os.environ.get("HF_TOKEN") else "sdxl")
 FLUX_MODEL = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.1-schnell")
 # 3D backend: "trellis" (default) or "hunyuan" (Hunyuan3D-2.0, image-conditioned
 # only — text prompts go through the SDXL concept stage first). Hunyuan needs
@@ -137,9 +140,15 @@ def _concept_image(prompt: str, seed: int):
         if CONCEPT_MODEL == "flux":
             pipe = DiffusionPipeline.from_pretrained(FLUX_MODEL, torch_dtype=torch.bfloat16).to("cuda")
         else:
-            pipe = DiffusionPipeline.from_pretrained(
-                SDXL_MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
-            ).to("cuda")
+            # Finetune repos often ship no fp16 variant files; fall back cleanly.
+            try:
+                pipe = DiffusionPipeline.from_pretrained(
+                    SDXL_MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
+                ).to("cuda")
+            except Exception:
+                pipe = DiffusionPipeline.from_pretrained(
+                    SDXL_MODEL, torch_dtype=torch.float16, use_safetensors=True
+                ).to("cuda")
         pipe.set_progress_bar_config(disable=True)
         if not small_card:
             _pipes[key] = pipe
@@ -283,6 +292,7 @@ def health():
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded": sorted(_pipes.keys()),
         "backend": BACKEND,
+        "concept_model": CONCEPT_MODEL,
         "text_via_image": TEXT_VIA_IMAGE,
         "model_loaded": bool(_pipes),  # back-compat
         # Seconds since the last /generate (or boot). An external janitor can
