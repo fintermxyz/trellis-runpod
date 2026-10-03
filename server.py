@@ -138,23 +138,9 @@ CONCEPT_NEGATIVE = (
 )
 
 
-def _concept_image(prompt: str, seed: int, name: str = ""):
-    """Concept render of the prompt: one centered, front-facing, symmetric
-    object on a plain backdrop. Symmetry constraints matter: the 3D stage sees
-    ONE view and hallucinates the back, so an ambiguous pose becomes mirrored
-    limbs and doubled tails. FLUX.1-schnell by default (far better anatomy
-    than SDXL base); the 3D stage's rembg strips the background after."""
-    import gc
-
+def _load_concept(keep: bool):
+    """The concept (text -> image) diffusion pipeline, cached in _pipes when `keep`."""
     import torch
-
-    # Small (24 GB) cards can't hold the concept model next to a 3D pipeline;
-    # big cards keep everything resident and skip the reload tax.
-    small_card = _gpu_total_gb() < 30
-    if small_card:
-        _pipes.clear()
-        gc.collect()
-        torch.cuda.empty_cache()
 
     key = f"concept_{CONCEPT_MODEL}"
     pipe = _pipes.get(key)
@@ -174,8 +160,30 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
                     SDXL_MODEL, torch_dtype=torch.float16, use_safetensors=True
                 ).to("cuda")
         pipe.set_progress_bar_config(disable=True)
-        if not small_card:
+        if keep:
             _pipes[key] = pipe
+    return pipe
+
+
+def _concept_image(prompt: str, seed: int, name: str = ""):
+    """Concept render of the prompt: one centered, front-facing, symmetric
+    object on a plain backdrop. Symmetry constraints matter: the 3D stage sees
+    ONE view and hallucinates the back, so an ambiguous pose becomes mirrored
+    limbs and doubled tails. FLUX.1-schnell by default (far better anatomy
+    than SDXL base); the 3D stage's rembg strips the background after."""
+    import gc
+
+    import torch
+
+    # Small (24 GB) cards can't hold the concept model next to a 3D pipeline;
+    # big cards keep everything resident and skip the reload tax.
+    small_card = _gpu_total_gb() < 30
+    if small_card:
+        _pipes.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    pipe = _load_concept(keep=not small_card)
     total_steps = 4 if CONCEPT_MODEL == "flux" else 30
 
     def on_step(_pipe, step, _t, kwargs):
@@ -474,3 +482,44 @@ def asset(fname: str, x_token: str = Header(default="")):
     if not p.exists():
         raise HTTPException(404, "missing")
     return FileResponse(str(p))
+
+
+# --- Warm-up on boot --------------------------------------------------------
+# A cold pod used to download and load every model on the first job, so that
+# visitor waited minutes. Now the server does it in the background as soon as
+# it starts; /generate answers 409 "busy" meanwhile, which the worker retries.
+WARM_ON_BOOT = os.environ.get("WARM_ON_BOOT", "1") != "0"
+
+
+def _warm() -> None:
+    with _lock:
+        t0 = time.time()
+        try:
+            big_card = _gpu_total_gb() >= 30
+            if BACKEND == "hunyuan":
+                from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+                _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+                if HUNYUAN_PAINT:
+                    from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+                    _pipes["hy_paint"] = Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+            else:
+                _get_pipe("image")
+            if TEXT_VIA_IMAGE:
+                if big_card:
+                    _load_concept(keep=True)  # resident alongside the 3D pipeline
+                else:
+                    # 24 GB cards swap per job; at least have the weights on disk.
+                    from huggingface_hub import snapshot_download
+
+                    snapshot_download(FLUX_MODEL if CONCEPT_MODEL == "flux" else SDXL_MODEL)
+            print(f"warm-up done in {time.time() - t0:.0f}s: {sorted(_pipes)}", flush=True)
+        except Exception as e:  # never keep the server from serving
+            print(f"warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
+
+
+@app.on_event("startup")
+def _start_warm() -> None:
+    if WARM_ON_BOOT:
+        threading.Thread(target=_warm, daemon=True).start()
