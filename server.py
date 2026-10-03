@@ -137,6 +137,37 @@ CONCEPT_NEGATIVE = (
     "rear view, dynamic pose, motion blur, text, watermark, busy background, scenery, frame, border, human hands"
 )
 
+# Long, rigid things (vehicles, furniture, buildings...) need the opposite of
+# the creature template: a straight front view shows none of their length, so
+# the 3D stage guesses the depth and the model comes out squat (a bus as deep
+# as it is wide). A raised three-quarter view shows front and side together.
+OBJECT_SUFFIX = (
+    ", single object, three-quarter view from slightly above showing the front and one full side, "
+    "true real-world proportions and full length visible, entire object in frame with margin, "
+    "3D render style, plain light gray studio background, soft even lighting, highly detailed"
+)
+OBJECT_NEGATIVE = (
+    "cropped, cut off, multiple objects, front view only, head-on view, flat orthographic view, "
+    "squashed, stubby, chibi, toy-like proportions, foreshortened, distorted proportions, fisheye, "
+    "motion blur, text, watermark, busy background, scenery, road, frame, border, human hands"
+)
+OBJECT_WORDS = re.compile(
+    r"\b(bus|buses|car|cars|truck|lorry|van|tractor|train|tram|locomotive|carriage|wagon|cart|"
+    r"bike|bicycle|motorbike|motorcycle|scooter|boat|ship|yacht|canoe|kayak|submarine|plane|"
+    r"aeroplane|airplane|aircraft|jet|helicopter|rocket|spaceship|tank|taxi|cab|limo|limousine|"
+    r"ambulance|jeep|suv|forklift|excavator|digger|bulldozer|crane|caravan|trailer|sled|sleigh|"
+    r"skateboard|surfboard|sofa|couch|bench|table|desk|bed|cabinet|wardrobe|dresser|bookshelf|"
+    r"shelf|piano|guitar|violin|house|building|cottage|castle|tower|bridge|barn|shed|church|"
+    r"sword|rifle|gun|keyboard|laptop|bottle|shoe|boot|chair)\b",
+    re.IGNORECASE,
+)
+
+
+def _concept_template(prompt: str) -> tuple[str, str]:
+    """(suffix, negative) for the prompt: the raised three-quarter view for long,
+    rigid objects, the symmetric front view for creatures and everything else."""
+    return (OBJECT_SUFFIX, OBJECT_NEGATIVE) if OBJECT_WORDS.search(prompt) else (CONCEPT_SUFFIX, CONCEPT_NEGATIVE)
+
 
 def _load_concept(keep: bool):
     """The concept (text -> image) diffusion pipeline, cached in _pipes when `keep`."""
@@ -166,10 +197,11 @@ def _load_concept(keep: bool):
 
 
 def _concept_image(prompt: str, seed: int, name: str = ""):
-    """Concept render of the prompt: one centered, front-facing, symmetric
-    object on a plain backdrop. Symmetry constraints matter: the 3D stage sees
-    ONE view and hallucinates the back, so an ambiguous pose becomes mirrored
-    limbs and doubled tails. FLUX.1-schnell by default (far better anatomy
+    """Concept render of the prompt: one centered object on a plain backdrop.
+    Creatures get a symmetric front view (the 3D stage sees ONE view and
+    hallucinates the back, so an ambiguous pose becomes mirrored limbs and
+    doubled tails); long, rigid objects get a raised three-quarter view so
+    their length is visible (see _concept_template). FLUX.1-schnell by default (far better anatomy
     than SDXL base); the 3D stage's rembg strips the background after."""
     import gc
 
@@ -191,6 +223,7 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
             _stage(name, "concept", (step + 1) / total_steps)
         return kwargs
 
+    suffix, negative = _concept_template(prompt)
     if name:
         _stage(name, "concept", 0.0)
     try:
@@ -198,7 +231,7 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
         if CONCEPT_MODEL == "flux":
             # schnell is distilled: 4 steps, guidance 0, no negative prompt.
             img = pipe(
-                prompt=f"{prompt}{CONCEPT_SUFFIX}",
+                prompt=f"{prompt}{suffix}",
                 num_inference_steps=4,
                 guidance_scale=0.0,
                 width=1024,
@@ -208,8 +241,8 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
             ).images[0]
         else:
             img = pipe(
-                prompt=f"{prompt}{CONCEPT_SUFFIX}",
-                negative_prompt=CONCEPT_NEGATIVE,
+                prompt=f"{prompt}{suffix}",
+                negative_prompt=negative,
                 num_inference_steps=30,
                 guidance_scale=7.0,
                 width=1024,
