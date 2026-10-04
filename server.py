@@ -71,6 +71,17 @@ def _stage(name: str, stage: str, frac: float = 0.0) -> None:
         "updated": time.time(),
     }
 
+
+def _fail(name: str, err: BaseException) -> None:
+    """Keep a job's error on its progress record: the caller's HTTP request has usually been cut by the
+    RunPod proxy long before a late failure, so /progress is the only place the worker can read it."""
+    p = _progress.get(name, {"stage": "failed", "pct": 0})
+    _progress[name] = {**p, "error": f"{type(err).__name__}: {err}"[:500], "failed": True, "updated": time.time()}
+
+
+# Set when the boot warm-up fails, shown on /health (container logs aren't reachable from the worker).
+_warm_error: str | None = None
+
 MODELS = {
     "text": os.environ.get("TEXT_MODEL", "microsoft/TRELLIS-text-xlarge"),
     "image": os.environ.get("IMAGE_MODEL", "microsoft/TRELLIS-image-large"),
@@ -400,6 +411,7 @@ def health():
         # sees traffic from every client, so idle is judged here.
         "idle_s": int(time.time() - _last_used),
         "boot_id": BOOT_ID,
+        "warm_error": _warm_error,
         "busy": _lock.locked(),
     }
 
@@ -512,6 +524,7 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         raise
     except Exception as e:  # surface the real error to the client
         traceback.print_exc()
+        _fail(req.name, e)
         raise HTTPException(500, f"{type(e).__name__}: {e}")
     finally:
         _last_used = time.time()
@@ -571,6 +584,9 @@ def _warm() -> None:
                     snapshot_download(FLUX_MODEL if CONCEPT_MODEL == "flux" else SDXL_MODEL)
             print(f"warm-up done in {time.time() - t0:.0f}s: {sorted(_pipes)}", flush=True)
         except Exception as e:  # never keep the server from serving
+            global _warm_error
+            _warm_error = f"{type(e).__name__}: {e}"[:500]
+            traceback.print_exc()
             print(f"warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
 
 
