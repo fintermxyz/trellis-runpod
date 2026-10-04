@@ -297,9 +297,9 @@ def _fetch_used_weights() -> None:
     """Download only the Hunyuan files the pipelines actually load into HY3DGEN_DIR.
 
     Left to itself hy3dgen downloads whole subfolders: the shape model's folder holds the same 4.9 GB
-    weights five times over (.ckpt, fp16 .ckpt, .safetensors, ...) = 24.6 GB, and the paint folders keep
-    every UNet/VAE as both .bin and .safetensors. Fetching just config.yaml + model.fp16.safetensors for
-    shape, and one format per paint/delight component, cuts a first boot from ~50 GB to ~20 GB.
+    weights five times over (.ckpt, fp16 .ckpt, .safetensors, ...) = 24.6 GB, of which only
+    model.fp16.safetensors (4.9 GB) is loaded. Fetching just that and config.yaml for shape (paint and
+    delight in full) cuts a first boot from ~50 GB to ~30 GB.
     """
     global _weights_ready
     if _weights_ready:
@@ -315,11 +315,10 @@ def _fetch_used_weights() -> None:
     files = list_repo_files(HUNYUAN_MODEL)
     want = ["hunyuan3d-dit-v2-0/config.yaml", "hunyuan3d-dit-v2-0/model.fp16.safetensors"]
     if HUNYUAN_PAINT:
+        # Paint and delight in full: the paint loader opens unet/diffusion_pytorch_model.bin by name (a
+        # .safetensors-only copy fails with FileNotFoundError), so their format twins can't be dropped.
         for folder in (paint, "hunyuan3d-delight-v2-0"):
-            in_folder = [f for f in files if f.startswith(folder + "/")]
-            # diffusers prefers .safetensors: drop the .bin twin wherever a component has one.
-            has_safe = {os.path.dirname(f) for f in in_folder if f.endswith(".safetensors")}
-            want += [f for f in in_folder if not (f.endswith(".bin") and os.path.dirname(f) in has_safe)]
+            want += [f for f in files if f.startswith(folder + "/")]
     dest = HY3DGEN_DIR / HUNYUAN_MODEL
     t0 = time.time()
     for f in want:
