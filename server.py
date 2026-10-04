@@ -378,7 +378,11 @@ def _hunyuan_generate(img, req) -> int:
     if HUNYUAN_PAINT and req.paint:
         if "hy_paint" not in _pipes:
             _stage(req.name, "texture", 0.05)
-            _pipes["hy_paint"] = _load_paint()
+            # The background warm-up may be loading it right now: wait for that rather than load twice.
+            if WARM_ON_BOOT and not _paint_ready.is_set():
+                _paint_ready.wait(timeout=15 * 60)
+            if "hy_paint" not in _pipes:
+                _pipes["hy_paint"] = _load_paint()
         _stage(req.name, "texture", 0.1)
         mesh = _pipes["hy_paint"](mesh, image=img)
 
@@ -601,6 +605,28 @@ def asset(fname: str, x_token: str = Header(default="")):
 WARM_ON_BOOT = os.environ.get("WARM_ON_BOOT", "1") != "0"
 
 
+# Set once the paint model is loaded (or its background load has given up), so a textured job that
+# arrives while it's still loading waits for it instead of loading a second copy.
+_paint_ready = threading.Event()
+
+
+def _warm_paint() -> None:
+    """Load the paint model in the background, outside the generation lock: free drafts don't use it, so
+    they run while it loads (a cold start used to block every job for the whole ~3-5 min warm-up)."""
+    t0 = time.time()
+    try:
+        if "hy_paint" not in _pipes:
+            _pipes["hy_paint"] = _load_paint()
+        print(f"paint ready in {time.time() - t0:.0f}s", flush=True)
+    except Exception as e:
+        global _warm_error
+        _warm_error = f"{type(e).__name__}: {e}"[:500]
+        traceback.print_exc()
+        print(f"paint warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
+    finally:
+        _paint_ready.set()
+
+
 def _warm() -> None:
     with _lock:
         t0 = time.time()
@@ -610,8 +636,10 @@ def _warm() -> None:
                 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
                 _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
-                if HUNYUAN_PAINT:
+                if HUNYUAN_PAINT and not big_card:
+                    # 24 GB cards: paint swaps with the concept model per job, keep the old order.
                     _pipes["hy_paint"] = _load_paint()
+                    _paint_ready.set()
             else:
                 _get_pipe("image")
             if TEXT_VIA_IMAGE:
@@ -622,12 +650,15 @@ def _warm() -> None:
                     from huggingface_hub import snapshot_download
 
                     snapshot_download(FLUX_MODEL if CONCEPT_MODEL == "flux" else SDXL_MODEL)
-            print(f"warm-up done in {time.time() - t0:.0f}s: {sorted(_pipes)}", flush=True)
+            print(f"warm-up done in {time.time() - t0:.0f}s: {sorted(_pipes)} (drafts can run)", flush=True)
         except Exception as e:  # never keep the server from serving
             global _warm_error
             _warm_error = f"{type(e).__name__}: {e}"[:500]
             traceback.print_exc()
             print(f"warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
+    # Big cards: shape + concept are resident and the lock is free, so drafts run now; paint follows.
+    if BACKEND == "hunyuan" and HUNYUAN_PAINT and not _paint_ready.is_set():
+        threading.Thread(target=_warm_paint, daemon=True).start()
 
 
 @app.on_event("startup")
