@@ -102,6 +102,9 @@ FLUX_MODEL = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.1-schnell")
 # BACKEND=hunyuan in the pod env so bootstrap installs hy3dgen.
 BACKEND = os.environ.get("BACKEND", "trellis")
 HUNYUAN_MODEL = os.environ.get("HUNYUAN_MODEL", "tencent/Hunyuan3D-2")
+# hy3dgen looks here first (<dir>/<repo>/<subfolder>) and only falls back to downloading whole subfolders
+# from the Hub when it's missing. On the pod volume, so a restart doesn't fetch again.
+HY3DGEN_DIR = Path(os.environ.setdefault("HY3DGEN_MODELS", "/workspace/hy3dgen"))
 HUNYUAN_PAINT = os.environ.get("HUNYUAN_PAINT", "1") != "0"
 
 
@@ -287,6 +290,44 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
     return img
 
 
+_weights_ready = False
+
+
+def _fetch_used_weights() -> None:
+    """Download only the Hunyuan files the pipelines actually load into HY3DGEN_DIR.
+
+    Left to itself hy3dgen downloads whole subfolders: the shape model's folder holds the same 4.9 GB
+    weights five times over (.ckpt, fp16 .ckpt, .safetensors, ...) = 24.6 GB, and the paint folders keep
+    every UNet/VAE as both .bin and .safetensors. Fetching just config.yaml + model.fp16.safetensors for
+    shape, and one format per paint/delight component, cuts a first boot from ~50 GB to ~20 GB.
+    """
+    global _weights_ready
+    if _weights_ready:
+        return
+    import inspect
+
+    from huggingface_hub import hf_hub_download, list_repo_files
+    from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+    # The paint subfolder hy3dgen will ask for (turbo in current versions).
+    sig = inspect.signature(Hunyuan3DPaintPipeline.from_pretrained)
+    paint = sig.parameters["subfolder"].default if "subfolder" in sig.parameters else "hunyuan3d-paint-v2-0"
+    files = list_repo_files(HUNYUAN_MODEL)
+    want = ["hunyuan3d-dit-v2-0/config.yaml", "hunyuan3d-dit-v2-0/model.fp16.safetensors"]
+    if HUNYUAN_PAINT:
+        for folder in (paint, "hunyuan3d-delight-v2-0"):
+            in_folder = [f for f in files if f.startswith(folder + "/")]
+            # diffusers prefers .safetensors: drop the .bin twin wherever a component has one.
+            has_safe = {os.path.dirname(f) for f in in_folder if f.endswith(".safetensors")}
+            want += [f for f in in_folder if not (f.endswith(".bin") and os.path.dirname(f) in has_safe)]
+    dest = HY3DGEN_DIR / HUNYUAN_MODEL
+    t0 = time.time()
+    for f in want:
+        if not (dest / f).exists():
+            hf_hub_download(HUNYUAN_MODEL, f, local_dir=str(dest))
+    print(f"weights ready in {time.time() - t0:.0f}s: {len(want)} files under {dest}", flush=True)
+    _weights_ready = True
+
 def _load_paint():
     """Hunyuan3DPaintPipeline, working around a first-boot import failure.
 
@@ -315,6 +356,7 @@ def _load_paint():
             del sys.modules[name]
         importlib.invalidate_caches()
 
+    _fetch_used_weights()
     prepare()
     try:
         return Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
@@ -356,6 +398,7 @@ def _hunyuan_generate(img, req) -> int:
         _stage(req.name, "loading", 0.5)
         from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
+        _fetch_used_weights()
         _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
     _stage(req.name, "shape", 0.0)
     mesh = _pipes["hy_shape"](
@@ -609,6 +652,7 @@ def _warm() -> None:
             if BACKEND == "hunyuan":
                 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
+                _fetch_used_weights()
                 _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
                 if HUNYUAN_PAINT:
                     _pipes["hy_paint"] = _load_paint()
