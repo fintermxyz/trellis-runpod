@@ -43,6 +43,9 @@ app = FastAPI()
 _lock = threading.Lock()
 _pipes = {}
 _last_used = time.time()  # boot counts as activity: gives a fresh pod a grace period
+# Changes on every server start. The worker compares it across dispatches: a different id means the
+# server restarted (crash, OOM kill) and any job it was running is gone, so it re-sends at once.
+BOOT_ID = os.urandom(6).hex()
 # Per-job stage progress, polled by clients via GET /progress/<name>.
 # Stages run in order; pct is overall 0-100.
 _progress: dict = {}
@@ -119,6 +122,20 @@ def _get_pipe(mode: str):
         p.cuda()
         _pipes[mode] = p
     return _pipes[mode]
+
+
+# Sexual content is refused. The web app filters prompts before a job is created; this is the second
+# line for anything that reaches the pod directly. The concept negatives below steer SDXL away from
+# nudity for prompts that slip past both.
+BLOCKED_PROMPT = re.compile(
+    r"\b(nsfw|nude|nudes|nudity|naked|topless|bottomless|undress\w*|porn\w*|hentai|xxx|sex|sexy|sexual\w*|"
+    r"erotic\w*|fetish\w*|bdsm|bondage|lingerie|genital\w*|penis|penises|cock|cocks|dick|dicks|vagina\w*|"
+    r"pussy|pussies|boob|boobs|tits|titties|breasts|nipples?|areola\w*|butt\s*naked|asshole|anus|"
+    r"orgasm\w*|masturbat\w*|blowjob|handjob|cum|semen|stripper|strip\s*tease|onlyfans|"
+    r"loli|lolicon|shota|shotacon)\b",
+    re.IGNORECASE,
+)
+SAFE_NEGATIVE = "nsfw, nude, naked, nudity, sexual, erotic, exposed breasts, nipples, genitals, underwear, lingerie"
 
 
 def _gpu_total_gb() -> float:
@@ -224,6 +241,7 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
         return kwargs
 
     suffix, negative = _concept_template(prompt)
+    negative = f"{negative}, {SAFE_NEGATIVE}"
     if name:
         _stage(name, "concept", 0.0)
     try:
@@ -381,6 +399,8 @@ def health():
         # stop the pod when this grows large — the pod is the one place that
         # sees traffic from every client, so idle is judged here.
         "idle_s": int(time.time() - _last_used),
+        "boot_id": BOOT_ID,
+        "busy": _lock.locked(),
     }
 
 
@@ -411,6 +431,8 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         raise HTTPException(400, "image required for mode='image'")
     if req.mode == "text" and not req.prompt.strip():
         raise HTTPException(400, "prompt required for mode='text'")
+    if BLOCKED_PROMPT.search(req.prompt):
+        raise HTTPException(422, "prompt_blocked: sexual content is not allowed")
     if not _lock.acquire(timeout=2):
         raise HTTPException(409, "busy")
     global _last_used
