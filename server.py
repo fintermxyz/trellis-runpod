@@ -287,6 +287,50 @@ def _concept_image(prompt: str, seed: int, name: str = ""):
     return img
 
 
+def _load_paint():
+    """Hunyuan3DPaintPipeline, working around a first-boot import failure.
+
+    The paint model's multiview UNet ships its own Python file (hunyuan3d-paint-v2-0/unet/modules.py).
+    diffusers copies it into $HF_HOME/modules/diffusers_modules/local/ and imports it from there. On a
+    fresh volume that package doesn't exist when the server starts, Python's import system caches the
+    miss, and the import fails with "No module named 'diffusers_modules.local.modules'" for the rest of
+    the process (only a restart used to fix it). Creating the package up front, and retrying once with the
+    import caches cleared, makes the first boot work.
+    """
+    import importlib
+    import sys
+
+    from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+    def prepare() -> None:
+        from diffusers.utils.constants import HF_MODULES_CACHE
+        from diffusers.utils.dynamic_modules_utils import init_hf_modules
+
+        init_hf_modules()  # creates HF_MODULES_CACHE with __init__.py and puts it on sys.path
+        local = Path(HF_MODULES_CACHE) / "diffusers_modules" / "local"
+        local.mkdir(parents=True, exist_ok=True)
+        for pkg in (local.parent, local):
+            (pkg / "__init__.py").touch(exist_ok=True)
+        for name in [m for m in sys.modules if m.startswith("diffusers_modules")]:
+            del sys.modules[name]
+        importlib.invalidate_caches()
+
+    prepare()
+    try:
+        return Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+    except Exception as e:
+        # hy3dgen re-raises the ModuleNotFoundError as a generic "Something wrong while loading" error.
+        chain, err = [], e
+        while err is not None and len(chain) < 5:
+            chain.append(repr(err))
+            err = err.__cause__ or err.__context__
+        if not any("diffusers_modules" in c for c in chain):
+            raise
+        print(f"paint load hit the dynamic-module import miss, retrying: {e}", flush=True)
+        prepare()  # modules.py has been copied by now; clear the cached miss and import again
+        return Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+
+
 def _hunyuan_generate(img, req) -> int:
     """Hunyuan3D-2.0: image -> shape DiT -> cleanup -> optional texture paint.
     Writes <name>.glb then <name>.png (keep that order). Returns vertex count."""
@@ -334,9 +378,7 @@ def _hunyuan_generate(img, req) -> int:
     if HUNYUAN_PAINT and req.paint:
         if "hy_paint" not in _pipes:
             _stage(req.name, "texture", 0.05)
-            from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-            _pipes["hy_paint"] = Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+            _pipes["hy_paint"] = _load_paint()
         _stage(req.name, "texture", 0.1)
         mesh = _pipes["hy_paint"](mesh, image=img)
 
@@ -569,9 +611,7 @@ def _warm() -> None:
 
                 _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
                 if HUNYUAN_PAINT:
-                    from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-                    _pipes["hy_paint"] = Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
+                    _pipes["hy_paint"] = _load_paint()
             else:
                 _get_pipe("image")
             if TEXT_VIA_IMAGE:
