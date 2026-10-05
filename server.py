@@ -155,13 +155,16 @@ def _gpu_total_gb() -> float:
     return torch.cuda.get_device_properties(0).total_memory / 1e9
 
 
+# "Front view" without "symmetrical": asking for symmetry made the image model mirror whatever the subject
+# holds ("a man with a fish" came out holding two identical fish, one per hand, 2026-10-05).
 CONCEPT_SUFFIX = (
-    ", single object, perfectly centered, symmetrical front view, neutral standing pose, "
+    ", single subject, perfectly centered, front view facing the camera, neutral standing pose, "
     "full object in frame, limbs and tail clearly separated and visible, 3D render style, "
     "plain light gray studio background, soft even lighting, highly detailed"
 )
 CONCEPT_NEGATIVE = (
     "cropped, cut off, multiple objects, duplicated limbs, extra tail, collage, side view, "
+    "duplicate objects, two of the same object, mirrored copies, identical pair, twin objects, "
     "rear view, dynamic pose, motion blur, text, watermark, busy background, scenery, frame, border, human hands"
 )
 
@@ -176,6 +179,7 @@ OBJECT_SUFFIX = (
 )
 OBJECT_NEGATIVE = (
     "cropped, cut off, multiple objects, front view only, head-on view, flat orthographic view, "
+    "duplicate objects, two of the same object, mirrored copies, identical pair, "
     "squashed, stubby, chibi, toy-like proportions, foreshortened, distorted proportions, fisheye, "
     "motion blur, text, watermark, busy background, scenery, road, frame, border, human hands"
 )
@@ -575,6 +579,70 @@ def generate(req: GenReq, x_token: str = Header(default="")):
     finally:
         _last_used = time.time()
         _lock.release()
+
+
+class CutoutReq(BaseModel):
+    image: str  # data URL or raw base64
+
+
+_remover = None
+_remover_lock = threading.Lock()
+
+
+@app.post("/cutout")
+def cutout(req: CutoutReq, x_token: str = Header(default="")):
+    """What the 3D step will see for an uploaded photo: the same background removal generation uses, plus a
+    verdict the studio turns into advice before anyone spends a draft. Runs beside the generation lock (rembg
+    is light) so a check never queues behind a model being made.
+
+    verdict: "ok" | "cut_off" (the object runs off the photo's edges) | "background" (nearly the whole photo
+    was kept: the background wasn't separated, or the object fills the frame) | "empty" (nothing was found).
+    """
+    _check(x_token)
+    import numpy as np
+    from PIL import Image
+
+    global _remover
+    img = _decode_image(req.image)
+    img.thumbnail((1024, 1024))
+    if img.getextrema()[3][0] < 255:  # already transparent: use its own alpha
+        cut = img
+    else:
+        with _remover_lock:
+            if _remover is None:
+                from hy3dgen.rembg import BackgroundRemover
+
+                _remover = BackgroundRemover()
+            cut = _remover(img.convert("RGB")).convert("RGBA")
+    a = np.asarray(cut.getchannel("A")) > 128
+    h, w = a.shape
+    coverage = float(a.mean())
+    band = max(2, int(min(h, w) * 0.01))  # a thin strip along each edge
+    edges = {
+        "top": float(a[:band, :].mean()),
+        "bottom": float(a[-band:, :].mean()),
+        "left": float(a[:, :band].mean()),
+        "right": float(a[:, -band:].mean()),
+    }
+    touching = [k for k, v in edges.items() if v > 0.05]
+    if coverage < 0.02:
+        verdict = "empty"
+    elif coverage > 0.85:
+        verdict = "background"
+    elif len(touching) >= 2 or any(v > 0.25 for v in edges.values()):
+        verdict = "cut_off"
+    else:
+        verdict = "ok"
+    thumb = cut.copy()
+    thumb.thumbnail((384, 384))
+    buf = io.BytesIO()
+    thumb.save(buf, format="PNG", optimize=True)
+    return {
+        "verdict": verdict,
+        "coverage": round(coverage, 3),
+        "edges_touching": touching,
+        "cutout": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+    }
 
 
 @app.get("/progress/{name}")
