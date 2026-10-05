@@ -603,17 +603,24 @@ def cutout(req: CutoutReq, x_token: str = Header(default="")):
     from PIL import Image
 
     global _remover
+    t0 = time.time()
     img = _decode_image(req.image)
     img.thumbnail((1024, 1024))
+    t1 = time.time()
     if img.getextrema()[3][0] < 255:  # already transparent: use its own alpha
         cut = img
     else:
         with _remover_lock:
             if _remover is None:
-                from hy3dgen.rembg import BackgroundRemover
+                # The same rembg model hy3dgen's BackgroundRemover uses (u2net), but pinned to the CPU: the
+                # default provider list on this image cost a fixed ~24 s per call.
+                from rembg import new_session
 
-                _remover = BackgroundRemover()
-            cut = _remover(img.convert("RGB")).convert("RGBA")
+                _remover = new_session("u2net", providers=["CPUExecutionProvider"])
+            from rembg import remove
+
+            cut = remove(img.convert("RGB"), session=_remover, bgcolor=[255, 255, 255, 0]).convert("RGBA")
+    t2 = time.time()
     a = np.asarray(cut.getchannel("A")) > 128
     h, w = a.shape
     coverage = float(a.mean())
@@ -642,6 +649,7 @@ def cutout(req: CutoutReq, x_token: str = Header(default="")):
         "coverage": round(coverage, 3),
         "edges_touching": touching,
         "cutout": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+        "ms": {"decode": int((t1 - t0) * 1000), "remove": int((t2 - t1) * 1000), "total": int((time.time() - t0) * 1000)},
     }
 
 
