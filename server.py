@@ -444,6 +444,39 @@ def _decode_image(data: str):
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
 
 
+# Explicit photos are refused: the studio's photo check (/cutout) blocks them on upload, and /generate refuses
+# them too, for anything that skips the studio. A small ViT classifier (normal / nsfw); scores at or above
+# NSFW_BLOCK are blocked.
+NSFW_MODEL = os.environ.get("NSFW_MODEL", "Falconsai/nsfw_image_detection")
+NSFW_BLOCK = float(os.environ.get("NSFW_BLOCK", "0.7"))
+_nsfw = None
+_nsfw_lock = threading.Lock()
+
+
+def _nsfw_score(img) -> float:
+    """Probability that the image is sexually explicit (0..1)."""
+    global _nsfw
+    with _nsfw_lock:
+        if _nsfw is None:
+            from transformers import pipeline
+
+            _nsfw = pipeline("image-classification", model=NSFW_MODEL, device=-1)
+        out = _nsfw(img.convert("RGB"))
+    return float(next((o["score"] for o in out if o["label"].lower() == "nsfw"), 0.0))
+
+
+class ModerateReq(BaseModel):
+    image: str
+
+
+@app.post("/moderate")
+def moderate(req: ModerateReq, x_token: str = Header(default="")):
+    """NSFW score for one image (used to check uploads already stored)."""
+    _check(x_token)
+    score = _nsfw_score(_decode_image(req.image))
+    return {"nsfw": round(score, 4), "blocked": score >= NSFW_BLOCK}
+
+
 @app.get("/health")
 def health():
     import torch
@@ -495,6 +528,8 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         raise HTTPException(400, "prompt required for mode='text'")
     if BLOCKED_PROMPT.search(req.prompt):
         raise HTTPException(422, "prompt_blocked: sexual content is not allowed")
+    if req.mode == "image" and _nsfw_score(_decode_image(req.image)) >= NSFW_BLOCK:
+        raise HTTPException(422, "image_blocked: explicit images are not allowed")
     if not _lock.acquire(timeout=2):
         raise HTTPException(409, "busy")
     global _last_used
@@ -606,6 +641,10 @@ def cutout(req: CutoutReq, x_token: str = Header(default="")):
     t0 = time.time()
     img = _decode_image(req.image)
     img.thumbnail((1024, 1024))
+    nsfw = _nsfw_score(img)
+    if nsfw >= NSFW_BLOCK:
+        # Never echo an explicit image back; the studio refuses the upload.
+        return {"verdict": "explicit", "coverage": 0, "edges_touching": [], "cutout": "", "nsfw": round(nsfw, 3)}
     t1 = time.time()
     if img.getextrema()[3][0] < 255:  # already transparent: use its own alpha
         cut = img
@@ -726,6 +765,19 @@ def _warm() -> None:
                     from huggingface_hub import snapshot_download
 
                     snapshot_download(FLUX_MODEL if CONCEPT_MODEL == "flux" else SDXL_MODEL)
+            # Upload checks (photo check + explicit-image block) answer in seconds from the first upload.
+            try:
+                from PIL import Image as _Img
+
+                _nsfw_score(_Img.new("RGB", (64, 64), "gray"))
+                global _remover
+                with _remover_lock:
+                    if _remover is None:
+                        from rembg import new_session
+
+                        _remover = new_session("u2net", providers=["CPUExecutionProvider"])
+            except Exception as e:
+                print(f"upload-check warm-up failed: {e}", flush=True)
             print(f"warm-up done in {time.time() - t0:.0f}s: {sorted(_pipes)} (drafts can run)", flush=True)
         except Exception as e:  # never keep the server from serving
             global _warm_error
