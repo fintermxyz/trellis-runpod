@@ -335,6 +335,31 @@ def _load_paint():
         return Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
 
 
+def _birefnet_cut(img):
+    """Background removal with BiRefNet (MIT): returns RGBA. Loaded once, kept on the GPU (~1 GB)."""
+    import numpy as np
+    import torch
+    from torchvision import transforms
+
+    if "birefnet" not in _pipes:
+        from transformers import AutoModelForImageSegmentation
+
+        m = AutoModelForImageSegmentation.from_pretrained("ZhengPeng7/BiRefNet", trust_remote_code=True)
+        _pipes["birefnet"] = m.eval().to("cuda")
+    rgb = img.convert("RGB")
+    tf = transforms.Compose(
+        [transforms.Resize((1024, 1024)), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+    )
+    with torch.no_grad():
+        pred = _pipes["birefnet"](tf(rgb).unsqueeze(0).to("cuda"))[-1].sigmoid()[0, 0].float().cpu().numpy()
+    from PIL import Image
+
+    mask = Image.fromarray((pred * 255).astype(np.uint8)).resize(rgb.size, Image.BILINEAR)
+    out = rgb.convert("RGBA")
+    out.putalpha(mask)
+    return out
+
+
 def _hunyuan_generate(img, req) -> int:
     """Hunyuan3D-2.0: image -> shape DiT -> cleanup -> optional texture paint.
     Writes <name>.glb then <name>.png (keep that order). Returns vertex count."""
@@ -354,7 +379,8 @@ def _hunyuan_generate(img, req) -> int:
 
     alpha = img.getextrema()[3] if img.mode == "RGBA" else (255, 255)
     if alpha[0] == 255:  # no real transparency: strip the background
-        img = BackgroundRemover()(img.convert("RGB"))
+        # bg="birefnet" (opt-in, under test): sharper masks that keep thin parts u2net drops.
+        img = _birefnet_cut(img) if req.bg == "birefnet" else BackgroundRemover()(img.convert("RGB"))
 
     if "hy_shape" not in _pipes:
         _stage(req.name, "loading", 0.5)
@@ -366,7 +392,8 @@ def _hunyuan_generate(img, req) -> int:
         image=img,
         num_inference_steps=int(req.ss_steps or 30),
         guidance_scale=float(req.ss_cfg or 5.0),
-        octree_resolution=380,
+        octree_resolution=int(req.octree_resolution or 380),
+        **({"num_chunks": int(req.num_chunks)} if req.num_chunks else {}),
         generator=torch.manual_seed(req.seed),
     )[0]
 
@@ -377,6 +404,8 @@ def _hunyuan_generate(img, req) -> int:
     mesh = DegenerateFaceRemover()(mesh)
     # simplify 0.9 -> 40k faces (the repo's own texturing budget), 0.85 -> 60k.
     facenum = max(20000, min(120000, int(400000 * (1.0 - req.simplify))))
+    if req.max_faces:  # explicit budget (print exports want more than paint's 40k)
+        facenum = max(20000, min(500000, int(req.max_faces)))
     mesh = FaceReducer()(mesh, max_facenum=facenum)
 
     if HUNYUAN_PAINT and req.paint:
@@ -513,6 +542,11 @@ class GenReq(BaseModel):
     ss_cfg: float | None = None
     slat_steps: int | None = None
     slat_cfg: float | None = None
+    # Shape-quality options under test (unset = today's behaviour).
+    octree_resolution: int | None = None  # Hunyuan marching-cubes grid; 380 by default
+    num_chunks: int | None = None
+    max_faces: int | None = None  # face budget after cleanup, instead of the simplify mapping
+    bg: str | None = None  # "birefnet" to use BiRefNet instead of u2net for background removal
 
 
 @app.post("/generate")

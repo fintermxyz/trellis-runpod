@@ -7,6 +7,8 @@ set -euxo pipefail
 
 # pyrender renders the preview turntable (the repo has no server-side renderer).
 pip install einops omegaconf pymeshlab pygltflib "pyrender==0.1.45" PyOpenGL
+# BiRefNet background removal (opt-in, bg="birefnet"): its remote code needs timm and kornia.
+pip install timm kornia
 
 [ -d /app/Hunyuan3D-2 ] || git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git /app/Hunyuan3D-2
 pip install -e /app/Hunyuan3D-2 --no-deps
