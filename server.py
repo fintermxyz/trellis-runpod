@@ -336,22 +336,22 @@ def _load_paint():
 
 
 def _birefnet_cut(img):
-    """Background removal with BiRefNet (MIT): returns RGBA. Loaded once, kept on the GPU (~1 GB)."""
+    """Background removal with BiRefNet (MIT, ZhengPeng7/BiRefNet): returns RGBA. Loaded once, kept on the GPU (~1 GB)."""
     import numpy as np
     import torch
     from torchvision import transforms
 
-    if "birefnet" not in _pipes:
+    if "hy_birefnet" not in _pipes:  # hy_ prefix: survives the small-card eviction in _hunyuan_generate
         from transformers import AutoModelForImageSegmentation
 
         m = AutoModelForImageSegmentation.from_pretrained("ZhengPeng7/BiRefNet", trust_remote_code=True)
-        _pipes["birefnet"] = m.eval().to("cuda")
+        _pipes["hy_birefnet"] = m.eval().to("cuda")
     rgb = img.convert("RGB")
     tf = transforms.Compose(
         [transforms.Resize((1024, 1024)), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
     )
     with torch.no_grad():
-        pred = _pipes["birefnet"](tf(rgb).unsqueeze(0).to("cuda"))[-1].sigmoid()[0, 0].float().cpu().numpy()
+        pred = _pipes["hy_birefnet"](tf(rgb).unsqueeze(0).to("cuda"))[-1].sigmoid()[0, 0].float().cpu().numpy()
     from PIL import Image
 
     mask = Image.fromarray((pred * 255).astype(np.uint8)).resize(rgb.size, Image.BILINEAR)
@@ -379,8 +379,17 @@ def _hunyuan_generate(img, req) -> int:
 
     alpha = img.getextrema()[3] if img.mode == "RGBA" else (255, 255)
     if alpha[0] == 255:  # no real transparency: strip the background
-        # bg="birefnet" (opt-in, under test): sharper masks that keep thin parts u2net drops.
-        img = _birefnet_cut(img) if req.bg == "birefnet" else BackgroundRemover()(img.convert("RGB"))
+        # BiRefNet by default (2026-10-07 lab: same or better masks, and jobs 35-55% faster because it stays
+        # loaded, where BackgroundRemover() reloaded u2net every job). bg="u2net" keeps the old path; any
+        # BiRefNet failure falls back to it rather than failing the job.
+        if req.bg == "u2net":
+            img = BackgroundRemover()(img.convert("RGB"))
+        else:
+            try:
+                img = _birefnet_cut(img)
+            except Exception as e:
+                print(f"birefnet failed, using u2net: {type(e).__name__}: {e}", flush=True)
+                img = BackgroundRemover()(img.convert("RGB"))
 
     if "hy_shape" not in _pipes:
         _stage(req.name, "loading", 0.5)
@@ -546,7 +555,7 @@ class GenReq(BaseModel):
     octree_resolution: int | None = None  # Hunyuan marching-cubes grid; 380 by default
     num_chunks: int | None = None
     max_faces: int | None = None  # face budget after cleanup, instead of the simplify mapping
-    bg: str | None = None  # "birefnet" to use BiRefNet instead of u2net for background removal
+    bg: str | None = None  # background removal: BiRefNet by default; "u2net" for the old remover
 
 
 @app.post("/generate")
@@ -785,6 +794,12 @@ def _warm() -> None:
                 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
                 _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+                try:  # the default background remover, so the first photo job doesn't wait for it
+                    from PIL import Image as _Img
+
+                    _birefnet_cut(_Img.new("RGB", (64, 64), "gray"))
+                except Exception as e:
+                    print(f"birefnet warm-up failed (jobs fall back to u2net): {e}", flush=True)
                 if HUNYUAN_PAINT and not big_card:
                     # 24 GB cards: paint swaps with the concept model per job, keep the old order.
                     _pipes["hy_paint"] = _load_paint()
