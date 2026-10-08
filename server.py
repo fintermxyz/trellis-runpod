@@ -113,7 +113,7 @@ HUNYUAN_PAINT = os.environ.get("HUNYUAN_PAINT", "1") != "0"
 # SHAPE_MODEL_DEFAULT picks the model for requests that don't say (and the one warmed at boot), so a pod can
 # be switched wholesale. Texture paint is the 2.0 paint model either way.
 SHAPE_MODELS = ("2.0", "2.1")
-SHAPE_MODEL_DEFAULT = os.environ.get("SHAPE_MODEL_DEFAULT", "2.0").strip()
+SHAPE_MODEL_DEFAULT = os.environ.get("SHAPE_MODEL_DEFAULT", "2.1").strip()  # 2.1 since 2026-10-08 (lab: better shapes)
 if SHAPE_MODEL_DEFAULT not in SHAPE_MODELS:
     print(f"SHAPE_MODEL_DEFAULT={SHAPE_MODEL_DEFAULT!r} is not one of {SHAPE_MODELS}; using 2.0", flush=True)
     SHAPE_MODEL_DEFAULT = "2.0"
@@ -634,7 +634,7 @@ class GenReq(BaseModel):
     num_chunks: int | None = None
     max_faces: int | None = None  # face budget after cleanup, instead of the simplify mapping
     bg: str | None = None  # background removal: BiRefNet by default; "u2net" for the old remover
-    shape_model: str | None = None  # Hunyuan shape model, "2.0" | "2.1"; unset = SHAPE_MODEL_DEFAULT ("2.0")
+    shape_model: str | None = None  # Hunyuan shape model, "2.0" | "2.1"; unset = SHAPE_MODEL_DEFAULT ("2.1")
 
 
 @app.post("/generate")
