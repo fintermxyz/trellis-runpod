@@ -1,0 +1,63 @@
+name: build-trellis2
+
+# Builds the TRELLIS.2 generation server (Dockerfile.trellis2) for A/B testing and publishes it ONLY as
+# ghcr.io/fintermxyz/trellis-runpod:t2-<commit sha> and :t2-latest. Never :latest, which the
+# production (Hunyuan) pods run.
+on:
+  push:
+    branches: [trellis2]
+    paths: [Dockerfile.trellis2, install_deps_trellis2.sh, server_trellis2.py, .github/workflows/build-trellis2.yml]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-trellis2
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      # The CUDA devel base + torch + compiled extensions need ~30 GB; a stock runner has ~14 GB free.
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - name: Free more disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.trellis2
+          push: true
+          provenance: false
+          # Layer cache in the Actions cache: a server_trellis2.py-only change rebuilds one layer.
+          cache-from: type=gha,scope=trellis2
+          cache-to: type=gha,scope=trellis2,mode=max
+          tags: |
+            ghcr.io/fintermxyz/trellis-runpod:t2-${{ github.sha }}
+            ghcr.io/fintermxyz/trellis-runpod:t2-latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/fintermxyz/trellis-runpod
+            org.opencontainers.image.description=Microsoft TRELLIS.2 image-to-3D generation server (A/B test build)
+      - name: Disk after build
+        if: always()
+        run: df -h /

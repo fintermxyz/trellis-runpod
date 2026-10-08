@@ -1,0 +1,54 @@
+# 3D generation server for RunPod pods: Microsoft TRELLIS.2 (image -> 3D, 4B), same HTTP API as server.py.
+# Built for A/B testing against the Hunyuan3D-2.0 image (Dockerfile); published only as
+# ghcr.io/fintermxyz/trellis-runpod:t2-* tags. Everything is compiled at build time without a GPU;
+# a pod only downloads model weights (to HF_HOME on the volume) on first start.
+# torch 2.6.0 + CUDA 12.4 is what microsoft/TRELLIS.2's setup.sh installs.
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+
+# libegl1/libgles2/libglvnd0: pyrender's EGL preview renderer. libjpeg-dev: setup.sh --basic.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.10 python3.10-dev python3-pip python-is-python3 \
+        git curl ca-certificates build-essential libjpeg-dev libgl1 libegl1 libgles2 libglvnd0 libopengl0 \
+        libgomp1 libx11-6 libxext6 libsm6 libice6 libxrender1 libdrm2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --upgrade pip setuptools wheel
+
+RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Pinned TRELLIS.2 checkout (MIT licensed, (c) Microsoft). o-voxel's eigen is a submodule.
+ARG TRELLIS2_SHA=75fbf0183001ed9876c8dbb35de6b68552ee08bd
+RUN git clone https://github.com/microsoft/TRELLIS.2.git /app/TRELLIS.2 \
+    && git -C /app/TRELLIS.2 checkout ${TRELLIS2_SHA} \
+    && git -C /app/TRELLIS.2 submodule update --init --recursive \
+    && rm -rf /app/TRELLIS.2/.git /app/TRELLIS.2/assets/example_image
+
+# CUDA extensions are compiled ahead of time without a GPU: A40/A6000 (8.6), L40S/6000 Ada (8.9),
+# H100 (9.0) + PTX for anything newer on the same CUDA major. FORCE_CUDA makes setup.py files that
+# probe torch.cuda.is_available() build the CUDA path anyway. MAX_JOBS keeps nvcc inside the
+# runner's 16 GB of RAM. The stubs dir lets nvdiffrec link -lcuda without a driver.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0+PTX" \
+    FORCE_CUDA=1 \
+    MAX_JOBS=3 \
+    CUDA_HOME=/usr/local/cuda
+COPY install_deps_trellis2.sh /app/install_deps_trellis2.sh
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs bash /app/install_deps_trellis2.sh && rm -rf /root/.cache/pip /tmp/*
+
+COPY server_trellis2.py /app/server_trellis2.py
+# NVIDIA_DRIVER_CAPABILITIES=all: EGL (pyrender previews) needs the graphics capability; the CUDA base
+# image only asks for compute,utility. HF_TOKEN is never baked in: pass it in the pod env (DINOv3 is gated).
+ENV PYTHONPATH=/app/TRELLIS.2 \
+    ATTN_BACKEND=flash_attn \
+    SPARSE_CONV_BACKEND=flex_gemm \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    PYOPENGL_PLATFORM=egl \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    BACKEND=trellis2 \
+    HF_HOME=/workspace/hf \
+    OUT_DIR=/workspace/out
+
+WORKDIR /app
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "server_trellis2:app", "--host", "0.0.0.0", "--port", "8000"]
