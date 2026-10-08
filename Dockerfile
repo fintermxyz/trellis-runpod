@@ -1,4 +1,5 @@
-# 3D generation server for RunPod pods: TRELLIS + Hunyuan3D-2.0 (BACKEND=hunyuan, the default).
+# 3D generation server for RunPod pods: TRELLIS + Hunyuan3D-2.0 (BACKEND=hunyuan, the default),
+# plus the Hunyuan3D-2.1 shape model as an opt-in (shape_model="2.1" per request, or SHAPE_MODEL_DEFAULT).
 # Everything is installed and compiled at build time, so a pod from this image only
 # downloads model weights on first start instead of running bootstrap.sh (~15 min).
 # torch 2.4.0 + CUDA 12.1 is the combination microsoft/TRELLIS's setup.sh pins its wheels to.
@@ -27,6 +28,11 @@ RUN bash /app/install_deps.sh
 # TORCH_CUDA_ARCH_LIST above).
 COPY install_deps_hunyuan.sh /app/install_deps_hunyuan.sh
 RUN bash /app/install_deps_hunyuan.sh && rm -rf /root/.cache
+
+# Hunyuan3D-2.1 shape model (hy3dshape, pure Python, no pip changes) for shape_model="2.1" requests.
+# check_hy21.py imports it next to hy3dgen and runs a tiny random-weight 2.1 pipeline on the CPU.
+COPY install_deps_hy21.sh check_hy21.py /app/
+RUN bash /app/install_deps_hy21.sh && python /app/check_hy21.py && rm -rf /root/.cache
 
 COPY server.py /app/server.py
 ENV PYTHONPATH=/app/TRELLIS \

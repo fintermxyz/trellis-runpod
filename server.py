@@ -12,6 +12,9 @@ Two modes:
                   rembg strips the background) -> 3D. Markedly higher fidelity;
                   this is the Tripo-style path (generate/choose an image first).
 
+BACKEND=hunyuan: Hunyuan3D shape (+ 2.0 paint). shape_model="2.0" (default) or "2.1" picks the shape
+DiT per request; SHAPE_MODEL_DEFAULT sets the default for the pod.
+
 The two pipelines don't fit a 24 GB card together, so switching modes evicts
 the other pipeline (first request in a new mode pays the load).
 
@@ -103,6 +106,21 @@ FLUX_MODEL = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.1-schnell")
 BACKEND = os.environ.get("BACKEND", "trellis")
 HUNYUAN_MODEL = os.environ.get("HUNYUAN_MODEL", "tencent/Hunyuan3D-2")
 HUNYUAN_PAINT = os.environ.get("HUNYUAN_PAINT", "1") != "0"
+# Shape model (BACKEND=hunyuan only), per request via GenReq.shape_model:
+#   "2.0" -> Hunyuan3D-2.0 shape DiT (hy3dgen, tencent/Hunyuan3D-2): the production model.
+#   "2.1" -> Hunyuan3D-2.1 shape DiT (hy3dshape, tencent/Hunyuan3D-2.1), under A/B test. Loaded on the
+#            first request that asks for it: that request first downloads ~7.4 GB of weights into HF_HOME.
+# SHAPE_MODEL_DEFAULT picks the model for requests that don't say (and the one warmed at boot), so a pod can
+# be switched wholesale. Texture paint is the 2.0 paint model either way.
+SHAPE_MODELS = ("2.0", "2.1")
+SHAPE_MODEL_DEFAULT = os.environ.get("SHAPE_MODEL_DEFAULT", "2.0").strip()
+if SHAPE_MODEL_DEFAULT not in SHAPE_MODELS:
+    print(f"SHAPE_MODEL_DEFAULT={SHAPE_MODEL_DEFAULT!r} is not one of {SHAPE_MODELS}; using 2.0", flush=True)
+    SHAPE_MODEL_DEFAULT = "2.0"
+HY21_MODEL = os.environ.get("HY21_MODEL", "tencent/Hunyuan3D-2.1")
+# Pinned HF revision of tencent/Hunyuan3D-2.1 (set HY21_REVISION=main to follow the repo).
+HY21_REVISION = os.environ.get("HY21_REVISION", "0b94677654c57bb9a6b6845cd7b704ccf551d327")
+HY21_SUBFOLDER = "hunyuan3d-dit-v2-1"
 
 
 def _check(x_token: str) -> None:
@@ -335,6 +353,65 @@ def _load_paint():
         return Hunyuan3DPaintPipeline.from_pretrained(HUNYUAN_MODEL)
 
 
+def _load_hy20_shape():
+    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+    return Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+
+
+def _load_hy21_shape():
+    """Hunyuan3D-2.1 shape pipeline (DiT 3.0B + VAE 0.3B + DINOv2-L 0.3B in one 7.4 GB fp16 checkpoint).
+
+    hy3dshape's own from_pretrained downloads into ~/.cache/hy3dgen (the container disk, lost with the pod),
+    so the weights are fetched here into the HF cache (HF_HOME, on the volume) and loaded from that file.
+    """
+    import torch
+    from huggingface_hub import snapshot_download
+    from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+
+    root = snapshot_download(HY21_MODEL, revision=HY21_REVISION, allow_patterns=[f"{HY21_SUBFOLDER}/*"])
+    d = Path(root) / HY21_SUBFOLDER
+    return Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
+        str(d / "model.fp16.ckpt"), str(d / "config.yaml"), device="cuda", dtype=torch.float16
+    )
+
+
+# shape_model -> (_pipes key, loader, GB of free VRAM wanted before loading it next to the other one).
+# Both keys start with "hy" so _hunyuan_generate's small-card eviction keeps them.
+SHAPE_PIPES = {
+    "2.0": ("hy_shape", _load_hy20_shape, 8.0),
+    "2.1": ("hy21_shape", _load_hy21_shape, 12.0),
+}
+
+
+def _shape_pipe(version: str, name: str = ""):
+    """The shape pipeline for `version`, loading it on first use. The other shape model is dropped first on
+    small cards, or when the GPU is too full to hold both (big cards normally keep both resident)."""
+    import gc
+
+    import torch
+
+    key, load, need_gb = SHAPE_PIPES[version]
+    if key not in _pipes:
+        if name:
+            _stage(name, "loading", 0.5)
+        others = [k for v, (k, _, _) in SHAPE_PIPES.items() if v != version and k in _pipes]
+        if others:
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9
+            if _gpu_total_gb() < 30 or free_gb < need_gb:
+                for k in others:
+                    del _pipes[k]
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"shape {version}: dropped {others} to make room ({free_gb:.1f} GB was free)", flush=True)
+        t0 = time.time()
+        _pipes[key] = load()
+        print(f"shape {version} loaded in {time.time() - t0:.0f}s", flush=True)
+    return _pipes[key]
+
+
 def _birefnet_cut(img):
     """Background removal with BiRefNet (MIT, ZhengPeng7/BiRefNet): returns RGBA. Loaded once, kept on the GPU (~1 GB)."""
     import numpy as np
@@ -361,7 +438,7 @@ def _birefnet_cut(img):
 
 
 def _hunyuan_generate(img, req) -> int:
-    """Hunyuan3D-2.0: image -> shape DiT -> cleanup -> optional texture paint.
+    """Hunyuan3D: image -> shape DiT (2.0 or 2.1, req.shape_model) -> cleanup -> optional 2.0 texture paint.
     Writes <name>.glb then <name>.png (keep that order). Returns vertex count."""
     import gc
 
@@ -370,7 +447,7 @@ def _hunyuan_generate(img, req) -> int:
     # Small cards: evict non-Hunyuan pipelines (shape+paint alone need ~16 GB).
     # Big cards keep the concept model resident too.
     if _gpu_total_gb() < 30:
-        for k in [k for k in list(_pipes) if not k.startswith("hy_")]:
+        for k in [k for k in list(_pipes) if not k.startswith(("hy_", "hy21_"))]:
             del _pipes[k]
         gc.collect()
         torch.cuda.empty_cache()
@@ -391,13 +468,11 @@ def _hunyuan_generate(img, req) -> int:
                 print(f"birefnet failed, using u2net: {type(e).__name__}: {e}", flush=True)
                 img = BackgroundRemover()(img.convert("RGB"))
 
-    if "hy_shape" not in _pipes:
-        _stage(req.name, "loading", 0.5)
-        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-
-        _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+    # Same inputs and sampler settings for 2.0 and 2.1, so an A/B differs only in the model.
+    version = req.shape_model or SHAPE_MODEL_DEFAULT
+    shape = _shape_pipe(version, req.name)
     _stage(req.name, "shape", 0.0)
-    mesh = _pipes["hy_shape"](
+    mesh = shape(
         image=img,
         num_inference_steps=int(req.ss_steps or 30),
         guidance_scale=float(req.ss_cfg or 5.0),
@@ -405,6 +480,8 @@ def _hunyuan_generate(img, req) -> int:
         **({"num_chunks": int(req.num_chunks)} if req.num_chunks else {}),
         generator=torch.manual_seed(req.seed),
     )[0]
+    if mesh is None:  # marching cubes found no surface (both pipelines return None rather than raise)
+        raise RuntimeError(f"Hunyuan {version} shape model produced no surface")
 
     from hy3dgen.shapegen import DegenerateFaceRemover, FaceReducer, FloaterRemover
 
@@ -524,6 +601,7 @@ def health():
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded": sorted(_pipes.keys()),
         "backend": BACKEND,
+        "shape_model_default": SHAPE_MODEL_DEFAULT,
         "concept_model": CONCEPT_MODEL,
         "text_via_image": TEXT_VIA_IMAGE,
         "model_loaded": bool(_pipes),  # back-compat
@@ -556,6 +634,7 @@ class GenReq(BaseModel):
     num_chunks: int | None = None
     max_faces: int | None = None  # face budget after cleanup, instead of the simplify mapping
     bg: str | None = None  # background removal: BiRefNet by default; "u2net" for the old remover
+    shape_model: str | None = None  # Hunyuan shape model, "2.0" | "2.1"; unset = SHAPE_MODEL_DEFAULT ("2.0")
 
 
 @app.post("/generate")
@@ -569,6 +648,10 @@ def generate(req: GenReq, x_token: str = Header(default="")):
         raise HTTPException(400, "image required for mode='image'")
     if req.mode == "text" and not req.prompt.strip():
         raise HTTPException(400, "prompt required for mode='text'")
+    if req.shape_model is not None and req.shape_model not in SHAPE_MODELS:
+        raise HTTPException(400, "shape_model must be '2.0' or '2.1'")
+    if req.shape_model == "2.1" and BACKEND != "hunyuan":
+        raise HTTPException(400, "shape_model='2.1' needs BACKEND=hunyuan")
     if BLOCKED_PROMPT.search(req.prompt):
         raise HTTPException(422, "prompt_blocked: sexual content is not allowed")
     if req.mode == "image" and _nsfw_score(_decode_image(req.image)) >= NSFW_BLOCK:
@@ -612,12 +695,14 @@ def generate(req: GenReq, x_token: str = Header(default="")):
             subject = req.prompt
 
         if BACKEND == "hunyuan":
+            req.shape_model = req.shape_model or SHAPE_MODEL_DEFAULT
             verts = _hunyuan_generate(subject, req)
             _stage(req.name, "done", 1.0)
             return {
                 "ok": True,
                 "mode": req.mode,
                 "backend": "hunyuan",
+                "shape_model": req.shape_model,
                 "ms": int((time.time() - t0) * 1000),
                 "verts": verts,
             }
@@ -791,9 +876,8 @@ def _warm() -> None:
         try:
             big_card = _gpu_total_gb() >= 30
             if BACKEND == "hunyuan":
-                from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-
-                _pipes["hy_shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(HUNYUAN_MODEL)
+                # Only the default shape model; the other one loads on the first request that asks for it.
+                _shape_pipe(SHAPE_MODEL_DEFAULT)
                 try:  # the default background remover, so the first photo job doesn't wait for it
                     from PIL import Image as _Img
 
