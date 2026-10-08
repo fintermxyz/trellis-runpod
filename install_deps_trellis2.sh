@@ -53,18 +53,27 @@ rm -rf /tmp/ext
 pip install "diffusers==0.35.2" "accelerate==1.10.1" rembg onnxruntime "pyrender==0.1.45" PyOpenGL pymeshfix scikit-image \
     fastapi uvicorn pydantic scipy
 
-# Fail the build here, not on the pod, if a compiled extension doesn't import. (Only imports that need
-# no GPU at import time; the CUDA kernels themselves can only be exercised on the pod.)
-# nvdiffrec_render links libcuda directly, which only exists on a GPU host: checked for presence only.
-python - <<'EOF'
-import importlib, importlib.util
+# Fail the build here, not on the pod, if a compiled extension is missing or doesn't load. flex_gemm (and
+# o_voxel, which imports it) set up Triton autotuners at import time, which needs a GPU driver, so their
+# compiled .so files are loaded directly instead. nvdiffrec_render links libcuda, which only exists on a GPU
+# host: checked for presence only. The CUDA kernels themselves can only be exercised on the pod.
+python - <<'EOF2'
+import glob, importlib, importlib.util, os, site
 import numpy as np
 if not hasattr(np, "infty"):
     np.infty = np.inf  # pyrender 0.1.45 predates numpy 2
-for m in ["torch", "flash_attn", "nvdiffrast.torch", "cumesh", "flex_gemm", "o_voxel",
-          "utils3d", "transformers", "diffusers", "pyrender", "pymeshfix", "rembg"]:
+for m in ["torch", "flash_attn", "nvdiffrast.torch", "cumesh", "utils3d", "transformers", "diffusers",
+          "pyrender", "pymeshfix", "rembg", "skimage", "trimesh", "cv2"]:
     importlib.import_module(m)
     print("import ok:", m)
-assert importlib.util.find_spec("nvdiffrec_render") is not None, "nvdiffrec_render missing"
+for name, pattern in [("flex_gemm.kernels.cuda", "flex_gemm/kernels/cuda*.so"), ("o_voxel._C", "o_voxel/_C*.so")]:
+    so = [f for d in site.getsitepackages() for f in glob.glob(os.path.join(d, pattern))]
+    assert so, f"{pattern} missing"
+    spec = importlib.util.spec_from_file_location(name, so[0])
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    print("extension loads:", so[0])
+for m in ["nvdiffrec_render", "flex_gemm", "o_voxel"]:
+    assert importlib.util.find_spec(m) is not None, f"{m} missing"
 from transformers import DINOv3ViTModel  # TRELLIS.2's image-cond model needs transformers >= 4.56
-EOF
+print("deps ok")
+EOF2
